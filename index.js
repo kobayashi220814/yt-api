@@ -1,6 +1,6 @@
 const express = require('express');
-const { YoutubeTranscript } = require('youtube-transcript');
 const axios = require('axios');
+const { Innertube } = require('youtubei.js');
 
 const app = express();
 app.use(express.json());
@@ -8,13 +8,19 @@ app.use(express.json());
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const PORT = process.env.PORT || 3000;
 
-// 語言 fallback 順序
+// 語言 fallback 順序（優先繁中 → 簡中 → 英）
 const LANG_FALLBACK = ['zh-TW', 'zh-Hant', 'zh-Hans', 'zh', 'en'];
+
+// 初始化 Innertube（啟動時建立一次，複用 session）
+let yt = null;
+async function getYT() {
+  if (!yt) yt = await Innertube.create();
+  return yt;
+}
 
 // 從 URL 或 ID 擷取 video ID
 function extractVideoId(input) {
   if (!input) return null;
-  // 純 ID（沒有斜線或點）
   if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
   try {
     const url = new URL(input);
@@ -27,48 +33,64 @@ function extractVideoId(input) {
 
 // 取字幕（含自動 fallback）
 async function fetchTranscriptWithFallback(videoId, preferredLang) {
+  const client = await getYT();
+  const info = await client.getInfo(videoId);
+  const transcriptInfo = await info.getTranscript();
+
+  // 取得所有可用語言
+  const available = transcriptInfo?.transcript?.languages ?? [];
+  const availableCodes = available.map(l => l.language_code ?? l.code ?? l);
+
+  // 建立嘗試順序
   const langsToTry = preferredLang
     ? [preferredLang, ...LANG_FALLBACK.filter(l => l !== preferredLang)]
     : LANG_FALLBACK;
 
-  let lastError = null;
+  // 找第一個有效語言
+  let targetLang = langsToTry.find(l =>
+    availableCodes.some(a => a === l || a.startsWith(l.split('-')[0]))
+  );
 
-  for (const lang of langsToTry) {
+  // 若都找不到，用第一個可用語言
+  if (!targetLang && availableCodes.length > 0) {
+    targetLang = availableCodes[0];
+  }
+
+  if (!targetLang) {
+    throw new Error(`此影片沒有字幕 (videoId: ${videoId})`);
+  }
+
+  // 切換語言（若需要）
+  let finalTranscript = transcriptInfo;
+  if (targetLang !== availableCodes[0]) {
     try {
-      const segments = await YoutubeTranscript.fetchTranscript(videoId, { lang });
-      const text = segments.map(s => s.text).join(' ');
-      return { text, segments, lang, videoId };
-    } catch (err) {
-      lastError = err;
-
-      // 若是「字幕被關閉」直接中斷，不用繼續嘗試
-      if (err.message?.includes('disabled')) {
-        throw new Error(`字幕已被影片作者關閉 (videoId: ${videoId})`);
-      }
+      finalTranscript = await transcriptInfo.transcript.selectLanguage(targetLang);
+    } catch {
+      // 切換失敗就用預設
     }
   }
 
-  // 所有語言都失敗，嘗試解析可用語言清單
-  const availableMatch = lastError?.message?.match(/Available languages: (.+)/);
-  const available = availableMatch ? availableMatch[1].split(', ') : [];
+  const segments = finalTranscript?.transcript?.content?.body?.initial_segments ?? [];
 
-  if (available.length > 0) {
-    // 用第一個可用語言再試一次
-    try {
-      const segments = await YoutubeTranscript.fetchTranscript(videoId, { lang: available[0] });
-      const text = segments.map(s => s.text).join(' ');
-      return { text, segments, lang: available[0], videoId, note: `fallback to ${available[0]}` };
-    } catch (e) {
-      throw new Error(`無法取得字幕，可用語言：${available.join(', ')}`);
-    }
+  if (segments.length === 0) {
+    throw new Error(`字幕內容為空 (videoId: ${videoId}, lang: ${targetLang})`);
   }
 
-  throw new Error(`無法取得字幕：${lastError?.message}`);
+  const text = segments
+    .map(s => s.snippet?.text ?? s.snippet?.runs?.map(r => r.text).join('') ?? '')
+    .filter(Boolean)
+    .join(' ');
+
+  return {
+    videoId,
+    lang: targetLang,
+    availableLangs: availableCodes,
+    text,
+    segmentCount: segments.length,
+  };
 }
 
 // ─── API 1：關鍵字搜尋 ───────────────────────────────────────
-// POST /api/search
-// Body: { query, maxResults?, regionCode?, order?, videoDuration? }
 app.post('/api/search', async (req, res) => {
   const { query, maxResults = 10, regionCode = 'TW', order = 'relevance', videoDuration = 'any' } = req.body;
 
@@ -107,8 +129,6 @@ app.post('/api/search', async (req, res) => {
 });
 
 // ─── API 2：取字幕 ────────────────────────────────────────────
-// POST /api/transcript
-// Body: { url, lang? }
 app.post('/api/transcript', async (req, res) => {
   const { url, lang } = req.body;
 
@@ -127,6 +147,9 @@ app.post('/api/transcript', async (req, res) => {
 
 // ─── 健康檢查 ─────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// 預熱 Innertube
+getYT().then(() => console.log('Innertube ready'));
 
 app.listen(PORT, () => {
   console.log(`yt-api running on port ${PORT}`);
